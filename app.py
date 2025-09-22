@@ -10,6 +10,7 @@ GOOGLE_SHEET_CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vSwiZjQ1
 SALARY_CAP = 50000
 
 # ------------------ HTML Templates ------------------
+
 PLAYER_HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
@@ -41,17 +42,15 @@ select { font-size: 14px; padding: 4px 8px; margin-left: 10px; }
 <form method="get" action="/lineups">
 <label>Number of Lineups:</label>
 <input type="number" name="count" value="1" min="1" max="10">
-<br><br>
 
 <label>Game Script:</label>
-<select name="script" required>
-  <option value="">Balanced (No Script)</option>
-  <option value="run">Run Heavy (RB CPT, RB/K/DST FLEX)</option>
-  <option value="pass">Pass Heavy (QB/WR/TE CPT & FLEX)</option>
+<select name="script">
+  <option value="">Balanced</option>
+  <option value="run">Run Heavy (RB Captain)</option>
+  <option value="pass">Pass Heavy (QB/WR/TE Captain)</option>
 </select>
 
 <br><br>
-
 <table>
 <thead>
 <tr>
@@ -150,20 +149,18 @@ def clean_data(df):
     name_col = next((c for c in df.columns if "PLAYER" in c), None)
     salary_col = next((c for c in df.columns if "SALARY" in c), None)
     proj_col = next((c for c in df.columns if "FINAL POINTS" in c), None)
-    team_col = next((c for c in df.columns if c in ["TEAM","TEAM"]), None)
-    pos_col = next((c for c in df.columns if c=="POS"), None)
-    df = df.rename(columns={name_col:"Name", salary_col:"Salary", proj_col:"Proj", team_col:"Team", pos_col:"POS"})
-    df["Salary"] = df["Salary"].astype(str).str.replace(r'[\$,]', '', regex=True)
-    df = df[df["Salary"].str.replace('.','',1).str.isnumeric()]
-    df["Salary"] = df["Salary"].astype(float)
-    df["Proj"] = pd.to_numeric(df["Proj"], errors='coerce')
-    df["Name"] = df["Name"].astype(str).str.strip()
-    df["Team"] = df["Team"].astype(str).str.strip().str.upper()
-    df["POS"] = df["POS"].astype(str).str.strip().str.upper()
-    df = df.dropna(subset=["Name","Salary","Proj","POS"]).drop_duplicates(subset=["Name"]).reset_index(drop=True)
-    return df[["Name","Team","POS","Salary","Proj"]]
+    team_col = next((c for c in df.columns if "TEAM" in c.upper()), None)
+    pos_col = next((c for c in df.columns if c == "POS"), None)
 
-# ------------------ Generate All Feasible Lineups ------------------
+    df = df.rename(columns={name_col: "Name", salary_col: "Salary", proj_col: "Proj", team_col: "Team", pos_col: "POS"})
+    df["Salary"] = df["Salary"].astype(str).str.replace(r'[\$,]', '', regex=True)
+    df = df[df["Salary"].str.replace('.', '', 1).str.isnumeric()]
+    df["Salary"] = df["Salary"].astype(float)
+    df["Proj"] = pd.to_numeric(df["Proj"], errors="coerce")
+    df = df.dropna(subset=["Name", "Salary", "Proj", "POS"]).drop_duplicates(subset=["Name"])
+    return df[["Name", "Team", "POS", "Salary", "Proj"]]
+
+# ------------------ Lineup Generator ------------------
 def generate_all_lineups(df, lock_cpt=None, lock_flex=[], exclude=[], max_lineups=5, script=None):
     players = df.copy()
     if exclude:
@@ -171,7 +168,7 @@ def generate_all_lineups(df, lock_cpt=None, lock_flex=[], exclude=[], max_lineup
     if len(players) < 6:
         return []
 
-    # CPT candidates based on lock or script
+    # Filter CPT pool
     if lock_cpt:
         cpt_pool = players[players["Name"] == lock_cpt]
     else:
@@ -182,79 +179,44 @@ def generate_all_lineups(df, lock_cpt=None, lock_flex=[], exclude=[], max_lineup
         else:
             cpt_pool = players
 
-    # Sort CPT candidates by salary descending (favor expensive CPTs)
     cpt_pool = cpt_pool.sort_values(by="Salary", ascending=False)
 
-    tried_combos = set()
+    flex_pool = players
     all_lineups = []
+    flex_combos = combinations(flex_pool["Name"], 5)
 
-    for cpt_row in cpt_pool.itertuples():
-        flex_pool = players[players["Name"] != cpt_row.Name]
-        flex_combos = combinations(flex_pool["Name"], 5)
+    for flex_names in flex_combos:
+        if not all(f in flex_names for f in lock_flex):
+            continue
 
-        for flex_names in flex_combos:
-            # Must include all locked flex players
-            if not all(f in flex_names for f in lock_flex):
+        for cpt_row in cpt_pool.itertuples():
+            if cpt_row.Name in flex_names:
                 continue
 
-            combo_key = tuple(sorted(flex_names + (cpt_row.Name,)))
-            if combo_key in tried_combos:
-                continue
-            tried_combos.add(combo_key)
-
-            # Enforce flex restrictions by script
-            if script == "run":
-                # Only RB, K, DST allowed in FLEX
-                allowed_flex = ["RB", "K", "DST"]
-                flex_rows = [players[players["Name"] == f].iloc[0] for f in flex_names]
-                if not all(fr.POS in allowed_flex for fr in flex_rows):
-                    continue
-            elif script == "pass":
-                # FLEX can only be QB, WR, TE
-                allowed_flex = ["QB", "WR", "TE"]
-                flex_rows = [players[players["Name"] == f].iloc[0] for f in flex_names]
-                if not all(fr.POS in allowed_flex for fr in flex_rows):
-                    continue
-
-            lineup = [{
-                "Name": cpt_row.Name,
-                "Role": "CPT",
-                "Salary": round(cpt_row.Salary * 1.5, -2),
-                "Proj": cpt_row.Proj * 1.5,
-                "Team": cpt_row.Team
-            }]
-
+            lineup = [{"Name": cpt_row.Name, "Role": "CPT", "Salary": round(cpt_row.Salary * 1.5, -2),
+                       "Proj": cpt_row.Proj * 1.5, "Team": cpt_row.Team}]
             for name in flex_names:
-                p_row = players[players["Name"] == name].iloc[0]
-                lineup.append({
-                    "Name": p_row.Name,
-                    "Role": "FLEX",
-                    "Salary": p_row.Salary,
-                    "Proj": p_row.Proj,
-                    "Team": p_row.Team
-                })
+                row = players[players["Name"] == name].iloc[0]
+                lineup.append({"Name": row.Name, "Role": "FLEX", "Salary": row.Salary,
+                               "Proj": row.Proj, "Team": row.Team})
 
             total_salary = sum(p["Salary"] for p in lineup)
             if total_salary <= SALARY_CAP:
                 total_proj = sum(p["Proj"] for p in lineup)
-                all_lineups.append({
-                    "players": lineup,
-                    "Salary": total_salary,
-                    "Projected": total_proj
-                })
+                all_lineups.append({"players": lineup, "Salary": total_salary, "Projected": total_proj})
 
             if len(all_lineups) >= max_lineups:
-                return sorted(all_lineups, key=lambda x: x["Projected"], reverse=True)
+                break
+        if len(all_lineups) >= max_lineups:
+            break
 
-    return sorted(all_lineups, key=lambda x: x["Projected"], reverse=True)
+    return sorted(all_lineups, key=lambda x: x["Projected"], reverse=True)[:max_lineups]
 
 # ------------------ Routes ------------------
 @app.route('/')
 def player_pool():
     try:
-        r = requests.get(GOOGLE_SHEET_CSV_URL, timeout=10)
-        r.raise_for_status()
-        df = pd.read_csv(StringIO(r.text))
+        df = pd.read_csv(StringIO(requests.get(GOOGLE_SHEET_CSV_URL, timeout=10).text))
         df = clean_data(df)
         players = df.to_dict(orient="records")
         return render_template_string(PLAYER_HTML_TEMPLATE, players=players)
@@ -264,27 +226,25 @@ def player_pool():
 @app.route('/lineups')
 def generate_lineups():
     try:
-        r = requests.get(GOOGLE_SHEET_CSV_URL, timeout=10)
-        r.raise_for_status()
-        df = pd.read_csv(StringIO(r.text))
+        df = pd.read_csv(StringIO(requests.get(GOOGLE_SHEET_CSV_URL, timeout=10).text))
         df = clean_data(df)
 
-        lock_cpt = request.args.get('lock_cpt')
-        lock_flex = request.args.getlist('lock_flex')
-        exclude = request.args.getlist('exclude')
-        script = request.args.get('script')
-        count = int(request.args.get('count', 1))
-        count = max(1, min(count, 10))
+        lock_cpt = request.args.get("lock_cpt")
+        lock_flex = request.args.getlist("lock_flex")
+        exclude = request.args.getlist("exclude")
+        count = int(request.args.get("count", 1))
+        script = request.args.get("script", "").lower()
 
-        lineups = generate_all_lineups(df, lock_cpt, lock_flex, exclude, max_lineups=count, script=script)
+        count = max(1, min(count, 10))
+        lineups = generate_all_lineups(df, lock_cpt, lock_flex, exclude, count, script)
+
         if not lineups:
             return render_template_string(LINEUP_HTML_TEMPLATE, lineups=[], error="Could not generate lineups with these selections.")
 
         return render_template_string(LINEUP_HTML_TEMPLATE, lineups=lineups, error=None)
 
     except Exception as e:
-        return f"<p>Error generating lineup: {e}</p>"
+        return f"<p>Error generating lineups: {e}</p>"
 
 if __name__ == '__main__':
     app.run(debug=True)
-
