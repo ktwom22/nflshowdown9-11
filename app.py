@@ -14,7 +14,7 @@ PLAYER_HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
+<meta charset="UTF-8" />
 <title>Player Pool</title>
 <style>
 body { font-family: 'Segoe UI', Tahoma, sans-serif; margin: 20px; background: #f5f6fa; color: #2c3e50; }
@@ -30,6 +30,7 @@ input[type=checkbox], input[type=radio], input[type=number] { transform: scale(1
 button { padding: 10px 16px; background-color: #27ae60; color: white; border: none; border-radius: 5px; cursor: pointer; font-size: 14px; }
 button:hover { background-color: #2ecc71; }
 label { font-weight: 500; margin-right: 10px; }
+select { font-size: 14px; padding: 4px 8px; margin-left: 10px; }
 </style>
 </head>
 <body>
@@ -40,6 +41,15 @@ label { font-weight: 500; margin-right: 10px; }
 <form method="get" action="/lineups">
 <label>Number of Lineups:</label>
 <input type="number" name="count" value="1" min="1" max="10">
+<br><br>
+
+<label>Game Script:</label>
+<select name="script" required>
+  <option value="">Balanced (No Script)</option>
+  <option value="run">Run Heavy (RB CPT, RB/K/DST FLEX)</option>
+  <option value="pass">Pass Heavy (QB/WR/TE CPT & FLEX)</option>
+</select>
+
 <br><br>
 
 <table>
@@ -82,7 +92,7 @@ LINEUP_HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
+<meta charset="UTF-8" />
 <title>Generated Lineups</title>
 <style>
 body { font-family: 'Segoe UI', Tahoma, sans-serif; margin: 20px; background: #f5f6fa; color: #2c3e50; }
@@ -140,7 +150,7 @@ def clean_data(df):
     name_col = next((c for c in df.columns if "PLAYER" in c), None)
     salary_col = next((c for c in df.columns if "SALARY" in c), None)
     proj_col = next((c for c in df.columns if "FINAL POINTS" in c), None)
-    team_col = next((c for c in df.columns if c in ["TEAM","TEam"]), None)
+    team_col = next((c for c in df.columns if c in ["TEAM","TEAM"]), None)
     pos_col = next((c for c in df.columns if c=="POS"), None)
     df = df.rename(columns={name_col:"Name", salary_col:"Salary", proj_col:"Proj", team_col:"Team", pos_col:"POS"})
     df["Salary"] = df["Salary"].astype(str).str.replace(r'[\$,]', '', regex=True)
@@ -154,45 +164,89 @@ def clean_data(df):
     return df[["Name","Team","POS","Salary","Proj"]]
 
 # ------------------ Generate All Feasible Lineups ------------------
-def generate_all_lineups(df, lock_cpt=None, lock_flex=[], exclude=[], max_lineups=5):
+def generate_all_lineups(df, lock_cpt=None, lock_flex=[], exclude=[], max_lineups=5, script=None):
     players = df.copy()
     if exclude:
         players = players[~players["Name"].isin(exclude)]
     if len(players) < 6:
         return []
 
-    cpt_candidates = players[players["Name"]==lock_cpt] if lock_cpt else players
+    # CPT candidates based on lock or script
+    if lock_cpt:
+        cpt_pool = players[players["Name"] == lock_cpt]
+    else:
+        if script == "run":
+            cpt_pool = players[players["POS"] == "RB"]
+        elif script == "pass":
+            cpt_pool = players[players["POS"].isin(["QB", "WR", "TE"])]
+        else:
+            cpt_pool = players
+
+    # Sort CPT candidates by salary descending (favor expensive CPTs)
+    cpt_pool = cpt_pool.sort_values(by="Salary", ascending=False)
+
+    tried_combos = set()
     all_lineups = []
 
-    flex_candidates = players
-    flex_combos = combinations(flex_candidates["Name"], 5)
+    for cpt_row in cpt_pool.itertuples():
+        flex_pool = players[players["Name"] != cpt_row.Name]
+        flex_combos = combinations(flex_pool["Name"], 5)
 
-    for flex in flex_combos:
-        if not all(f in flex for f in lock_flex):
-            continue
-
-        for cpt_row in cpt_candidates.itertuples():
-            if cpt_row.Name in flex:
+        for flex_names in flex_combos:
+            # Must include all locked flex players
+            if not all(f in flex_names for f in lock_flex):
                 continue
-            lineup_players = [{"Name": cpt_row.Name, "Role":"CPT", "Salary": int(round(cpt_row.Salary*1.5,-2)),
-                               "Proj": cpt_row.Proj*1.5, "Team": cpt_row.Team}]
-            for f in flex:
-                f_row = players[players["Name"]==f].iloc[0]
-                lineup_players.append({"Name": f_row.Name, "Role":"FLEX", "Salary": f_row.Salary,
-                                       "Proj": f_row.Proj, "Team": f_row.Team})
 
-            total_salary = sum(p["Salary"] for p in lineup_players)
+            combo_key = tuple(sorted(flex_names + (cpt_row.Name,)))
+            if combo_key in tried_combos:
+                continue
+            tried_combos.add(combo_key)
+
+            # Enforce flex restrictions by script
+            if script == "run":
+                # Only RB, K, DST allowed in FLEX
+                allowed_flex = ["RB", "K", "DST"]
+                flex_rows = [players[players["Name"] == f].iloc[0] for f in flex_names]
+                if not all(fr.POS in allowed_flex for fr in flex_rows):
+                    continue
+            elif script == "pass":
+                # FLEX can only be QB, WR, TE
+                allowed_flex = ["QB", "WR", "TE"]
+                flex_rows = [players[players["Name"] == f].iloc[0] for f in flex_names]
+                if not all(fr.POS in allowed_flex for fr in flex_rows):
+                    continue
+
+            lineup = [{
+                "Name": cpt_row.Name,
+                "Role": "CPT",
+                "Salary": round(cpt_row.Salary * 1.5, -2),
+                "Proj": cpt_row.Proj * 1.5,
+                "Team": cpt_row.Team
+            }]
+
+            for name in flex_names:
+                p_row = players[players["Name"] == name].iloc[0]
+                lineup.append({
+                    "Name": p_row.Name,
+                    "Role": "FLEX",
+                    "Salary": p_row.Salary,
+                    "Proj": p_row.Proj,
+                    "Team": p_row.Team
+                })
+
+            total_salary = sum(p["Salary"] for p in lineup)
             if total_salary <= SALARY_CAP:
-                total_proj = sum(p["Proj"] for p in lineup_players)
-                all_lineups.append({"players": lineup_players, "Salary": total_salary, "Projected": total_proj})
+                total_proj = sum(p["Proj"] for p in lineup)
+                all_lineups.append({
+                    "players": lineup,
+                    "Salary": total_salary,
+                    "Projected": total_proj
+                })
 
             if len(all_lineups) >= max_lineups:
-                break
-        if len(all_lineups) >= max_lineups:
-            break
+                return sorted(all_lineups, key=lambda x: x["Projected"], reverse=True)
 
-    all_lineups = sorted(all_lineups, key=lambda x: x["Projected"], reverse=True)
-    return all_lineups[:max_lineups]
+    return sorted(all_lineups, key=lambda x: x["Projected"], reverse=True)
 
 # ------------------ Routes ------------------
 @app.route('/')
@@ -218,10 +272,11 @@ def generate_lineups():
         lock_cpt = request.args.get('lock_cpt')
         lock_flex = request.args.getlist('lock_flex')
         exclude = request.args.getlist('exclude')
+        script = request.args.get('script')
         count = int(request.args.get('count', 1))
         count = max(1, min(count, 10))
 
-        lineups = generate_all_lineups(df, lock_cpt, lock_flex, exclude, max_lineups=count)
+        lineups = generate_all_lineups(df, lock_cpt, lock_flex, exclude, max_lineups=count, script=script)
         if not lineups:
             return render_template_string(LINEUP_HTML_TEMPLATE, lineups=[], error="Could not generate lineups with these selections.")
 
